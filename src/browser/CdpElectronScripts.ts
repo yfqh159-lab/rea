@@ -9,6 +9,7 @@ import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 import { requiredScriptSource } from "./CdpCaptureValues.js";
 import type { ElectronScriptDraft } from "./CdpElectronScriptEvents.js";
 import { authorizedElectronFile } from "./ElectronFileScope.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 interface ElectronScriptCaptureInput {
   readonly connection: CdpConnection;
@@ -16,7 +17,6 @@ interface ElectronScriptCaptureInput {
   readonly signal?: AbortSignal;
   readonly request: InspectElectronPageInput;
   readonly scripts: readonly ElectronScriptDraft[];
-  readonly executionContextFrames: ReadonlyMap<string, string>;
   readonly frameIds: ReadonlySet<string>;
   readonly completeness: CdpCaptureCompleteness;
 }
@@ -34,14 +34,10 @@ export const captureElectronScripts = async (
       input.completeness.exclude("scripts", "out_of_target_scope");
       continue;
     }
-    const mappedFrame =
-      script.executionContextKey === null
-        ? undefined
-        : input.executionContextFrames.get(script.executionContextKey);
     const identity = {
       frame_id:
-        mappedFrame !== undefined && input.frameIds.has(mappedFrame)
-          ? mappedFrame
+        script.frameId !== null && input.frameIds.has(script.frameId)
+          ? script.frameId
           : null,
       file_path: path,
       cdp_hash: script.hash,
@@ -65,7 +61,7 @@ export const captureElectronScripts = async (
   return {
     total,
     items: items.sort((left, right) =>
-      left.script_key.localeCompare(right.script_key),
+      compareUnicodeCodePoints(left.script_key, right.script_key),
     ),
   };
 };

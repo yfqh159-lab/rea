@@ -18,12 +18,12 @@ import type { ToolContract } from "../contracts/toolContractTypes.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Evidence } from "../domain/evidence.js";
 import type { Result } from "../domain/result.js";
-import { observeJavaScriptRuntimeInputSchema } from "../domain/javascript/javascriptRuntimeObservation.js";
 import type { Logger } from "pino";
 import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import { deliverEvidenceResult } from "./contractToolHandler.js";
 
 interface RuntimeToolRegistration {
   readonly logger: Logger;
@@ -61,10 +61,8 @@ export const registerJavaScriptRuntimeObservationTools = (
         registration,
         observeContract,
         { input, context },
-        async (parsed, signal) => {
-          const request = observeJavaScriptRuntimeInputSchema.parse(parsed);
-          return observeJavaScriptRuntime(options.runtime, request, { signal });
-        },
+        (parsed, signal) =>
+          observeJavaScriptRuntime(options.runtime, parsed, { signal }),
       ),
   );
 };
@@ -96,13 +94,11 @@ const runRuntimeTool = async <Input>(
       const result = await logToolExecution(options.logger, contract.name, () =>
         execute(input, context.mcpReq.signal),
       );
-      if (!result.ok)
-        return options.delivery.toCallToolResult(result, contract);
-      const recorded = options.recordEvidence?.(result.value);
-      return options.delivery.toEvidenceToolResult(
-        result.value,
+      return deliverEvidenceResult(
+        options.server,
+        result,
         contract,
-        recorded,
+        options.recordEvidence,
       );
     },
   );

@@ -205,6 +205,65 @@ describe("Inspector execution-context lifecycle metadata", () => {
       await fake.close();
     }
   });
+
+  test.each([
+    ["malformed", "2", "1"],
+    ["valid", 2, 1],
+  ] as const)(
+    "accounts for %s context IDs in lifecycle events",
+    async (mode, createdId, destroyedId) => {
+      const fixture = await runtimeFixture();
+      const fake = await startFakeV8Inspector({
+        targetUrl: pathToFileURL(fixture.entry).href,
+        runtimeEvents: [
+          {
+            method: "Runtime.executionContextCreated",
+            params: { context: { id: 1, name: "main", origin: "" } },
+          },
+          {
+            method: "Runtime.executionContextCreated",
+            params: { context: { id: createdId, name: "worker", origin: "" } },
+          },
+          {
+            method: "Runtime.executionContextDestroyed",
+            params: { executionContextId: destroyedId },
+          },
+        ],
+        scriptEvents: [],
+      });
+      try {
+        const result = await new V8InspectorProvider().observe(
+          observeInput(fake.endpoint, fake.targetId, "node"),
+        );
+        if (!result.ok) throw result.error;
+        const invalidContextUnknowns = result.value.unknowns.filter((text) =>
+          text.includes("malformed execution-context ID"),
+        );
+        expect(result.value.capture).toMatchObject({
+          events_observed: 3,
+          events_retained: 3,
+          events_dropped: 0,
+          truncated: false,
+        });
+        if (mode === "malformed") {
+          expect(result.value.execution_contexts).toEqual([
+            { context_key: "1", state: "created", name: "main", origin: "" },
+          ]);
+          expect(invalidContextUnknowns).toEqual([
+            "2 execution-context lifecycle events with a missing or malformed execution-context ID were excluded; the affected contexts' lifecycle state is unknown.",
+          ]);
+          return;
+        }
+        expect(result.value.execution_contexts).toEqual([
+          { context_key: "1", state: "destroyed", name: "main", origin: "" },
+          { context_key: "2", state: "created", name: "worker", origin: "" },
+        ]);
+        expect(invalidContextUnknowns).toEqual([]);
+      } finally {
+        await fake.close();
+      }
+    },
+  );
 });
 
 test("rejects unknown runtime observation fields", () => {
@@ -230,6 +289,68 @@ test("returns every target exposed by the selected Inspector endpoint inline", a
     if (!listed.ok) throw listed.error;
     expect(listed.value.targets).toHaveLength(206);
     expect(listed.value.targets[0]?.target_id).toBe(fake.targetId);
+  } finally {
+    await fake.close();
+  }
+});
+
+test.each([
+  { label: "omitted", attached: undefined, expected: null },
+  { label: "explicitly detached", attached: false, expected: false },
+] as const)(
+  "preserves $label V8 attachment state through listing and observation",
+  async ({ attached, expected }) => {
+    const fixture = await runtimeFixture();
+    const fake = await startFakeV8Inspector({
+      targetUrl: pathToFileURL(fixture.entry).href,
+      ...(attached === undefined ? {} : { attached }),
+    });
+    try {
+      const provider = new V8InspectorProvider();
+      const listed = await provider.listTargets({
+        inspector_endpoint: fake.endpoint,
+      });
+      if (!listed.ok) throw listed.error;
+      expect(listed.value.targets[0]?.attached).toBe(expected);
+      if (expected === null)
+        expect(
+          listed.value.limitations.some((item) =>
+            item.includes("attachment state"),
+          ),
+        ).toBe(true);
+
+      const observed = await provider.observe(
+        observeInput(fake.endpoint, fake.targetId, "node"),
+      );
+      if (!observed.ok) throw observed.error;
+      expect(observed.value.target.attached).toBe(expected);
+      if (expected === null)
+        expect(
+          observed.value.limitations.some((item) =>
+            item.includes("attachment state"),
+          ),
+        ).toBe(true);
+    } finally {
+      await fake.close();
+    }
+  },
+);
+
+test("rejects a V8 target explicitly marked attached", async () => {
+  const fixture = await runtimeFixture();
+  const fake = await startFakeV8Inspector({
+    targetUrl: pathToFileURL(fixture.entry).href,
+    attached: true,
+  });
+  try {
+    const result = await new V8InspectorProvider().observe(
+      observeInput(fake.endpoint, fake.targetId, "node"),
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: { reason: "target_not_allowed" },
+    });
+    expect(fake.commands).toEqual([]);
   } finally {
     await fake.close();
   }

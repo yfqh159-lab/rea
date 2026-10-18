@@ -6,11 +6,18 @@ const [
   runId,
   shutdownMode = "acknowledge",
   diagnosticMode = "quiet",
+  healthMode = "ready",
+  inventoryFailure = "none",
 ] = process.argv.slice(2);
 let diagnosticOutputEmitted = false;
 const heldReplies = new Map();
+const sockets = new Set();
 if (process.send !== undefined)
   process.on("message", (message) => {
+    if (message?.disconnect === true) {
+      for (const socket of sockets) socket.destroy();
+      return;
+    }
     const reply = heldReplies.get(message?.release);
     if (reply === undefined) return;
     heldReplies.delete(message.release);
@@ -172,6 +179,8 @@ const sendEchoWithProgress = (send, request) => {
 };
 
 const server = createServer((socket) => {
+  sockets.add(socket);
+  socket.once("close", () => sockets.delete(socket));
   socket.on("error", () => undefined);
   socket.setEncoding("utf8");
   let buffer = "";
@@ -201,21 +210,27 @@ const server = createServer((socket) => {
         send({ id: request.id, error: { code: -32001, message: "bad token" } });
       } else if (request.method === "health") {
         emitDiagnosticOutput();
-        send(
-          {
-            id: request.id,
-            result: {
-              name: "REA Hopper bridge",
-              version: "1.0.0",
-              run_id: runId,
+        const reply = () =>
+          send(
+            {
+              id: request.id,
+              result: {
+                name: "REA Hopper bridge",
+                version: "1.0.0",
+                run_id: runId,
+                process_id: process.pid,
+              },
             },
-          },
-          true,
-        );
+            true,
+          );
+        if (healthMode === "gated") heldReplies.set(request.id, reply);
+        else if (healthMode === "ready") reply();
+        else throw new Error(`Unknown health fixture mode: ${healthMode}`);
       } else if (
         request.method === "shutdown" ||
         request.method === "shutdown_document"
       ) {
+        if (shutdownMode === "exit-without-ack") process.exit(0);
         send({ id: request.id, result: shutdownResult() });
         if (shutdownMode !== "cleanup-required") setTimeout(closeServer, 2);
       } else if (request.method === "hang") {
@@ -233,6 +248,19 @@ const server = createServer((socket) => {
         for (const message of bridgeEventMessages) send(message);
       } else if (request.method === "capability_unavailable") {
         send(capabilityUnavailableResult(request.id));
+      } else if (
+        inventoryFailure !== "none" &&
+        (request.method === "list_strings" ||
+          request.method === "list_procedures")
+      ) {
+        send({
+          id: request.id,
+          error: {
+            code: -32000,
+            type: inventoryFailure,
+            message: "fixture inventory unavailable",
+          },
+        });
       } else if (request.method === "current_document") {
         send({ id: request.id, result: "fixture" });
       } else if (enhancedFixtureResult(request.method) !== undefined) {

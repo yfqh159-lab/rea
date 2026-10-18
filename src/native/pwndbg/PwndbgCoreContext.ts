@@ -1,3 +1,8 @@
+import {
+  bindArtifactFileCleanup,
+  ArtifactFileCleanupFailure,
+  artifactFileCancellationCause,
+} from "../../artifacts/ArtifactFileOperation.js";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -17,14 +22,16 @@ import {
   type RecordedCrash,
 } from "../../domain/native/recordedCrash.js";
 import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
-import { runOwnedCommand } from "../../process/OwnedCommand.js";
+import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   capturedPwntoolsOutput,
   pwntoolsDecoderFailure,
 } from "../pwntools/PwntoolsFailures.js";
 import { PWNTOOLS_LIMITS } from "../pwntools/PwntoolsRelease.js";
 import { readPwntoolsFailureEvidence } from "../pwntools/PwntoolsResourceLimits.js";
-import type { PwntoolsLauncher } from "../pwntools/PwntoolsDecoder.js";
+import type { PwntoolsCommand } from "../pwntools/PwntoolsDecoder.js";
 
 const OPERATION = "inspect_recorded_crash";
 const replySchema = z.discriminatedUnion("ok", [
@@ -46,16 +53,18 @@ const replySchema = z.discriminatedUnion("ok", [
 export const inspectPwndbgCore = async ({
   environment,
   rootPath,
+  resources,
   diagnostics,
   options,
-  launcher,
+  runCommand,
   probePath,
 }: {
   readonly environment: Readonly<NodeJS.ProcessEnv>;
   readonly rootPath: string;
+  readonly resources: ArtifactResourceScope;
   readonly diagnostics: AnalysisCapturedOutput;
   readonly options: ExecutionOptions | undefined;
-  readonly launcher?: PwntoolsLauncher;
+  readonly runCommand: PwntoolsCommand;
   readonly probePath?: (
     path: string,
     kind: "file" | "directory",
@@ -126,9 +135,23 @@ export const inspectPwndbgCore = async ({
     { flag: "wx", mode: 0o600 },
   );
   let output: AnalysisCapturedOutput | undefined;
+  const failureContext = {
+    operation: OPERATION,
+    providerId: "pwndbg-core",
+    precedingOutput: diagnostics,
+  };
+  const failure = (cause: unknown) =>
+    pwntoolsDecoderFailure(
+      cause,
+      "debugger",
+      gdb,
+      environment.REA_PWNTOOLS_PYTHON ?? "",
+      {},
+      failureContext,
+    );
   try {
     options?.signal?.throwIfAborted();
-    const execution = await runOwnedCommand(
+    const execution = await runCommand(
       {
         command: environment.REA_PWNTOOLS_PYTHON ?? "",
         arguments: [
@@ -155,14 +178,7 @@ export const inspectPwndbgCore = async ({
           OMP_NUM_THREADS: "1",
         },
       },
-      {
-        timeoutMs: PWNTOOLS_LIMITS.timeoutMs,
-        diagnosticBytes: PWNTOOLS_LIMITS.diagnosticBytes,
-      },
-      {
-        ...(options?.signal === undefined ? {} : { signal: options.signal }),
-        ...(launcher === undefined ? {} : { launcher }),
-      },
+      failure,
     );
     output = capturedPwntoolsOutput(execution);
     let reply: z.output<typeof replySchema>;
@@ -171,21 +187,45 @@ export const inspectPwndbgCore = async ({
         replyPath,
         PWNTOOLS_LIMITS.outputBytes,
         options?.signal,
+        undefined,
+        resources,
       );
       reply = replySchema.parse(JSON.parse(raw.bytes.toString("utf8")));
     } catch (cause: unknown) {
-      if (options?.signal?.aborted)
-        throw new AnalysisCancelledError(OPERATION, {
+      if (
+        cause instanceof ArtifactReaderFailure &&
+        (cause.reason === "cancelled" ||
+          (cause instanceof ArtifactFileCleanupFailure &&
+            cause.fileCleanupFailure.outcome.kind === "completed" &&
+            options?.signal?.aborted))
+      ) {
+        const error = new AnalysisCancelledError(OPERATION, {
+          cause:
+            cause.reason === "cancelled"
+              ? artifactFileCancellationCause(cause)
+              : options?.signal?.reason,
           capturedOutput: recordedCrashStageOutput(diagnostics, output),
+          ...(cause instanceof ArtifactReaderFailure &&
+          cause.cleanup !== undefined
+            ? { cleanup: cause.cleanup }
+            : {}),
         });
-      throw new AnalysisOutputError(
+        bindArtifactFileCleanup(cause, error);
+        throw error;
+      }
+      const error = new AnalysisOutputError(
         OPERATION,
         `Core-only debugger reply failed: ${cause instanceof Error ? cause.message : String(cause)}`,
         {
           cause,
+          ...(cause instanceof ArtifactReaderFailure
+            ? { cleanup: cause.cleanup }
+            : {}),
           capturedOutput: recordedCrashStageOutput(diagnostics, output),
         },
       );
+      bindArtifactFileCleanup(cause, error);
+      throw error;
     }
     if (!reply.ok) {
       if (reply.reason === "unavailable" || reply.reason === "unsupported")
@@ -218,26 +258,23 @@ export const inspectPwndbgCore = async ({
       );
     return { ...reply.value, diagnostics: output };
   } catch (cause: unknown) {
-    if (
+    if (cause instanceof AnalysisError && cause.cleanupIncomplete) throw cause;
+    const primary =
       options?.signal?.aborted &&
       (cause === options.signal.reason ||
         (cause instanceof Error && cause.name === "AbortError"))
-    )
-      throw new AnalysisCancelledError(OPERATION, {
-        capturedOutput: recordedCrashStageOutput(diagnostics, output),
-      });
-    throw pwntoolsDecoderFailure(
-      cause,
-      "debugger",
-      gdb,
-      environment.REA_PWNTOOLS_PYTHON ?? "",
-      await readPwntoolsFailureEvidence(cause, stage),
-      {
-        operation: OPERATION,
-        providerId: "pwndbg-core",
-        precedingOutput: diagnostics,
-      },
-    );
+        ? new AnalysisCancelledError(OPERATION, {
+            capturedOutput: recordedCrashStageOutput(diagnostics, output),
+          })
+        : pwntoolsDecoderFailure(
+            cause,
+            "debugger",
+            gdb,
+            environment.REA_PWNTOOLS_PYTHON ?? "",
+            await readPwntoolsFailureEvidence(cause, stage, resources),
+            failureContext,
+          );
+    throw primary;
   }
 };
 

@@ -24,8 +24,6 @@ import { toolContract } from "../contracts/toolContracts.js";
 import type { ToolContract } from "../contracts/toolContractTypes.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Evidence } from "../domain/evidence.js";
-import { analyzeWebBundleInputSchema } from "../domain/webBundleAnalysis.js";
-import { inspectWebPageInputSchema } from "../domain/browserObservation.js";
 import type { Result } from "../domain/result.js";
 import type { Logger } from "pino";
 import { mcpProgressReporter } from "./mcpProgress.js";
@@ -33,6 +31,7 @@ import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import { deliverEvidenceResult } from "./contractToolHandler.js";
 
 interface BrowserToolRegistration {
   readonly logger: Logger;
@@ -86,11 +85,7 @@ export const registerBrowserTools = (
         inspectContract,
         { input, context },
         (parsed, { signal, progress }) =>
-          inspectWebPage(
-            options.browser,
-            inspectWebPageInputSchema.parse(parsed),
-            { signal, progress },
-          ),
+          inspectWebPage(options.browser, parsed, { signal, progress }),
       ),
   );
   server.registerTool(
@@ -102,14 +97,10 @@ export const registerBrowserTools = (
         analyzeContract,
         { input, context },
         (parsed, { signal, progress }) =>
-          analyzeWebBundle(
-            options.browser,
-            analyzeWebBundleInputSchema.parse(parsed),
-            {
-              signal,
-              progress,
-            },
-          ),
+          analyzeWebBundle(options.browser, parsed, {
+            signal,
+            progress,
+          }),
       ),
   );
   server.registerTool(
@@ -211,13 +202,11 @@ const runBrowserTool = async <Input>(
           progress: mcpProgressReporter(context),
         }),
       );
-      if (!result.ok)
-        return options.delivery.toCallToolResult(result, contract);
-      const recorded = options.recordEvidence?.(result.value);
-      return options.delivery.toEvidenceToolResult(
-        result.value,
+      return deliverEvidenceResult(
+        options.server,
+        result,
         contract,
-        recorded,
+        options.recordEvidence,
       );
     },
   );

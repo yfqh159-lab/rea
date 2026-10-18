@@ -26,12 +26,19 @@ export const createInspectorExclusionCounts = (): Record<
 });
 
 /** Stable safety and protocol limitations shared by target-list Evidence. */
-export const describeInspectorTargetLimitations = (): string[] => [
+export const describeInspectorTargetLimitations = (
+  attachmentStateUnknown = false,
+): string[] => [
   "REA attaches to an already-running exact target and never launches, resumes, evaluates, pauses, or mutates it.",
   "Only Runtime.enable and Debugger.enable are sent; source text, object values, EventEmitter activity, and Electron IPC are not inspected.",
   "The selected endpoint and target ID authorize observation; discovery file locations can remain unresolved and do not prove filesystem identity.",
   "Node discovery reports a best-effort pathname rather than an encoded file URL; lossy Windows paths and ambiguous underscores are preserved without guessing a file path.",
   "Every target exposed by the selected Inspector endpoint is eligible for observation; target IDs and locations are not authenticated as operating-system process identity.",
+  ...(attachmentStateUnknown
+    ? [
+        "Inspector discovery did not report the target's current debugger attachment state; it is retained as unknown, and observation rejects only targets explicitly marked attached.",
+      ]
+    : []),
   "No runtime graph depth is traversed because passive Inspector events do not establish require/import caller edges.",
 ];
 
@@ -211,13 +218,22 @@ export const finalizeInspectorCapture = async ({
         : [
             `${String(unresolvedScripts)} observed script location${unresolvedScripts === 1 ? " remains" : "s remain"} unverified; raw URLs and script metadata are retained.`,
           ]),
+      ...invalidContextUnknowns(state.invalidContexts),
       "Scripts collected before attachment may have been garbage-collected and therefore omitted.",
       "A bounded observation window cannot establish that an unobserved script or behavior never occurs.",
       "The declared Node/Electron process role is not authenticated by the Inspector protocol.",
     ],
-    limitations: describeInspectorTargetLimitations(),
+    limitations: describeInspectorTargetLimitations(target.attached === null),
   };
 };
+
+/** Report lifecycle events whose context identity could not be parsed. */
+const invalidContextUnknowns = (count: number): string[] =>
+  count === 0
+    ? []
+    : [
+        `${String(count)} execution-context lifecycle ${count === 1 ? "event with a missing or malformed execution-context ID was" : "events with a missing or malformed execution-context ID were"} excluded; the affected contexts' lifecycle state is unknown.`,
+      ];
 
 const scriptFromDraft = (
   draft: ScriptDraft,

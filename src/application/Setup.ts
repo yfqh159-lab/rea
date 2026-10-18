@@ -26,6 +26,7 @@ import {
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import type { SetupSkillInstallError } from "./SetupSkill.js";
 
 /** Discover, approve, and apply setup actions idempotently. */
 export const runSetup = async (
@@ -98,14 +99,21 @@ const runSetupWorkflow = async (
       [host, plannedActions, appliedActions, clients, clientStates],
       readinessScope,
     );
+  const failSkill = async (
+    error: SetupSkillInstallError,
+  ): Promise<SetupResult> => ({
+    ...(await fail(error.remediation)),
+    code: "skill_install_failed",
+  });
   const unsupported = await hostRemediation(host, false);
   if (unsupported !== undefined) return fail(unsupported);
   const initialState = await host.initialSetupState(options.readinessScope);
   let { hopperPath, providerEnvironment } = initialState;
   const discovery = await discoverSetupState({
     host,
-    providerEnvironment,
+    providerConfigured: initialState.providerConfigured,
     forceHopperInstall: options.installHopper,
+    hopperLauncherConfigured: initialState.hopperLauncherConfigured === true,
     proposeHopper:
       options.proposeHopper ?? (confirm !== undefined && !options.structured),
     initialDoctor: initialState.doctor,
@@ -120,12 +128,19 @@ const runSetupWorkflow = async (
     options.installSkill === undefined;
   const interactiveSelection =
     confirm !== undefined && !options.structured && clientSelectionAllowed;
-  let selectedClientIds = options.allDetectedClients
-    ? discovery.detectedClientIds
-    : (options.clientIds ??
-      options.readinessScope?.clients ??
-      discovery.defaultClientIds);
-  let selectedSkillClientIds = options.skillClientIds ?? selectedClientIds;
+  let selectedClientIds = [
+    ...new Set(
+      options.allDetectedClients
+        ? discovery.detectedClientIds
+        : (options.clientIds ??
+            options.readinessScope?.clients ??
+            discovery.defaultClientIds),
+    ),
+  ];
+  let selectedSkillClientIds =
+    options.skillClientIds ??
+    options.readinessScope?.skillClients ??
+    selectedClientIds;
   let skillNeedsInstall = await host.skillNeedsInstall(selectedSkillClientIds);
   let skillSelected =
     options.installSkill === true ||
@@ -220,6 +235,7 @@ const runSetupWorkflow = async (
     installHopper: planDiscovery.installHopper,
     installSkill,
     skillSelected,
+    selectedSkillClientIds,
     selectedClients: planned.selectedClients,
     clientsToConfigure: planned.clientsToConfigure,
   };
@@ -229,6 +245,12 @@ const runSetupWorkflow = async (
   );
 
   const manualRemediation = manualClientsRemediation(planned.selectedClients);
+  if (skillSelected) {
+    const admission = await host.validateSkillDirectories(
+      selectedSkillClientIds,
+    );
+    if (!admission.ok) return failSkill(admission.error);
+  }
   if (options.dryRun === true)
     return {
       status: "planned",
@@ -279,8 +301,16 @@ const runSetupWorkflow = async (
         : {}),
     };
 
+  // Approval may pause while a skill manager changes a selected directory.
+  if (planSelection.skillSelected) {
+    const admission = await host.validateSkillDirectories(
+      selectedSkillClientIds,
+    );
+    if (!admission.ok) return failSkill(admission.error);
+  }
   let selectedClients: readonly SetupClient[] =
     planSelection.clientsToConfigure;
+  let hopperWarning: string | undefined;
   if (
     planSelection.installHopper &&
     (interactiveApproval || options.installHopper)
@@ -297,7 +327,12 @@ const runSetupWorkflow = async (
       clientStates,
     });
     if ("failure" in install) return install.failure;
-    ({ hopperPath, providerEnvironment, selectedClients } = install);
+    ({
+      hopperPath,
+      providerEnvironment,
+      selectedClients,
+      warning: hopperWarning,
+    } = install);
   }
   const clientFailure = await configureDetectedClients({
     host,
@@ -311,18 +346,17 @@ const runSetupWorkflow = async (
       : { onProgress: options.onProgress }),
   });
   if (clientFailure !== undefined) return fail(clientFailure);
-  if (
-    planSelection.installSkill &&
-    !(await installSkillAction(
+  if (planSelection.installSkill) {
+    const skillFailure = await installSkillAction(
       host,
       options,
       appliedActions,
       selectedSkillClientIds,
-    ))
-  )
-    return fail(
-      "REA analysis skill could not be installed or verified. Check permissions for its planned skill directories, then rerun setup.",
     );
+    if (skillFailure !== undefined) {
+      return failSkill(skillFailure);
+    }
+  }
   const doctor = summarizeDoctor(await host.doctor(readinessScope));
   const remediation = combineRemediation(
     finalSetupRemediation(
@@ -331,6 +365,7 @@ const runSetupWorkflow = async (
       doctor.healthy,
       hopperPath,
     ),
+    hopperWarning,
     manualRemediation,
   );
   return {
@@ -383,14 +418,17 @@ const installHopperAction = async (input: {
     };
   }
   input.appliedActions.push("installed_hopper");
+  const warning = [installed.warning, installed.cleanupFailure]
+    .filter((value): value is string => value !== undefined)
+    .join(" ");
   emitProgress(input.options, {
     actionId: "install_hopper",
     label,
-    state: installed.cleanupFailure === undefined ? "completed" : "warning",
+    state: warning === "" ? "completed" : "warning",
     detail:
-      installed.cleanupFailure === undefined
+      warning === ""
         ? installed.launcherPath
-        : `${installed.launcherPath}; ${installed.cleanupFailure}`,
+        : `${installed.launcherPath}; ${warning}`,
   });
   const providerEnvironment = {
     ...input.providerEnvironment,
@@ -399,6 +437,7 @@ const installHopperAction = async (input: {
   return {
     hopperPath: installed.launcherPath,
     providerEnvironment,
+    ...(warning === "" ? {} : { warning }),
     selectedClients: await filterClientsNeedingConfigure(
       input.host,
       input.selectedClients,
@@ -413,7 +452,7 @@ const installSkillAction = async (
   options: SetupOptions,
   appliedActions: string[],
   skillClientIds: readonly string[],
-): Promise<boolean> => {
+): Promise<SetupSkillInstallError | undefined> => {
   const label = "REA reverse-engineering skill";
   emitProgress(options, {
     actionId: "install_skill",
@@ -421,22 +460,23 @@ const installSkillAction = async (
     state: "started",
   });
   const skill = await host.installSkill(skillClientIds);
-  if (skill === "failed") {
+  if (!skill.ok) {
     emitProgress(options, {
       actionId: "install_skill",
       label,
       state: "failed",
+      detail: skill.error.message,
     });
-    return false;
+    return skill.error;
   }
-  if (skill === "installed") appliedActions.push("installed_skill");
+  if (skill.value === "installed") appliedActions.push("installed_skill");
   emitProgress(options, {
     actionId: "install_skill",
     label,
-    state: skill === "installed" ? "completed" : "warning",
-    ...(skill === "unchanged" ? { detail: "Already current" } : {}),
+    state: skill.value === "installed" ? "completed" : "warning",
+    ...(skill.value === "unchanged" ? { detail: "Already current" } : {}),
   });
-  return true;
+  return undefined;
 };
 
 const setupFailure = async (
@@ -519,6 +559,7 @@ const resolvedReadinessScope = (
     readonly selectedClients: readonly SetupClient[];
     readonly installHopper: boolean;
     readonly skillSelected?: boolean;
+    readonly selectedSkillClientIds: readonly string[];
   },
 ): DoctorScope => ({
   clients: selection.selectedClients.map(({ name }) => name),
@@ -526,6 +567,9 @@ const resolvedReadinessScope = (
     ? ["hopper"]
     : (requested?.providers ?? []),
   skill: selection.skillSelected === true || requested?.skill === true,
+  ...(selection.skillSelected === true || requested?.skill === true
+    ? { skillClients: selection.selectedSkillClientIds }
+    : {}),
 });
 
 const summarizeDoctor = (report: DoctorReport): SetupDoctorSummary => ({

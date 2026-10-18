@@ -21,18 +21,20 @@ import { analyzeJavaScriptApplicationValidated } from "../application/javascript
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { reconcileJavaScriptRuntimeEvidenceValidated } from "../application/javascript/JavaScriptRuntimeReconciliationService.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
+import type { ElectronFuseService } from "../application/electron/ElectronFuseService.js";
 import { toolContract } from "../contracts/toolContracts.js";
 import type { ToolContract } from "../contracts/toolContractTypes.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Evidence } from "../domain/evidence.js";
 import type { Result } from "../domain/result.js";
-import { inspectElectronPageInputSchema } from "../domain/javascript/electronObservation.js";
 import type { Logger } from "pino";
 import { mcpProgressReporter } from "./mcpProgress.js";
 import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import { createEvidenceToolHandler } from "./contractToolHandler.js";
+import { deliverEvidenceResult } from "./contractToolHandler.js";
 
 interface ElectronToolRegistration {
   readonly artifactResources: ArtifactResourceScope;
@@ -41,6 +43,7 @@ interface ElectronToolRegistration {
   readonly activeLoadFailure?: OptionalProviderLoadFailure | undefined;
   readonly electron: ElectronObservationPort | undefined;
   readonly electronActive: ElectronActiveObservationPort | undefined;
+  readonly electronFuses: ElectronFuseService;
   readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
   readonly evidenceById: EvidenceLookup | undefined;
   readonly withAdmittedAnalysis?: WithAdmittedAnalysis;
@@ -58,6 +61,7 @@ export const registerElectronTools = (
   options: ElectronToolRegistration,
 ): void => {
   const registration = { ...options, delivery: server.delivery, server };
+  registerElectronFuseTool(server, options);
   const listContract = toolContract("list_electron_targets");
   const inspectContract = toolContract("inspect_electron_page");
   const analyzeContract = toolContract("analyze_javascript_application");
@@ -86,13 +90,11 @@ export const registerElectronTools = (
         registration,
         inspectContract,
         { input, context },
-        async (parsed, { signal, progress }) => {
-          const request = inspectElectronPageInputSchema.parse(parsed);
-          return inspectElectronPage(options.electron, request, {
+        (parsed, { signal, progress }) =>
+          inspectElectronPage(options.electron, parsed, {
             signal,
             progress,
-          });
-        },
+          }),
       ),
   );
   server.registerTool(
@@ -144,6 +146,25 @@ export const registerElectronTools = (
   );
 };
 
+const registerElectronFuseTool = (
+  server: EvidenceMcpServer,
+  options: ElectronToolRegistration,
+): void => {
+  const contract = toolContract("inspect_electron_fuses");
+  const handler = createEvidenceToolHandler(
+    server,
+    (input, execution) => options.electronFuses.inspect(input, execution),
+    options.logger,
+    options.recordEvidence,
+    options.withAdmittedAnalysis,
+  );
+  server.registerTool(
+    contract.name,
+    toolRegistrationOptions(contract),
+    handler(contract),
+  );
+};
+
 const runElectronTool = async <Input>(
   options: ElectronToolRegistration & {
     readonly delivery: ToolResultDelivery;
@@ -184,28 +205,11 @@ const runElectronTool = async <Input>(
           progress: mcpProgressReporter(context),
         }),
       );
-      if (!result.ok) {
-        const partial = result.error.partialObservation;
-        if (
-          partial !== undefined &&
-          "evidence_id" in partial &&
-          typeof partial.evidence_id === "string"
-        ) {
-          const recorded = options.recordEvidence?.(partial);
-          if (recorded !== undefined)
-            return options.delivery.toRecordedPartialErrorToolResult(
-              result.error,
-              partial.evidence_id,
-              recorded,
-            );
-        }
-        return options.delivery.toCallToolResult(result, contract);
-      }
-      const recorded = options.recordEvidence?.(result.value);
-      return options.delivery.toEvidenceToolResult(
-        result.value,
+      return deliverEvidenceResult(
+        options.server,
+        result,
         contract,
-        recorded,
+        options.recordEvidence,
       );
     },
   );

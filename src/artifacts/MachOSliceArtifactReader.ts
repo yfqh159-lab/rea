@@ -1,3 +1,4 @@
+import { assertArtifactReadActive } from "./ArtifactFileOperation.js";
 import { lstat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -8,10 +9,11 @@ import {
   type NativeCommandRunner,
 } from "../native/CommandRunner.js";
 import {
-  parseLipoArchitectures,
+  parseLipoOutput,
   type LipoArchitecture,
 } from "../native/parsers/lipo.js";
 import type { MachoSlice } from "../domain/apple/dylibResolution.js";
+import { machoCpuSubtypeBase } from "../domain/apple/machoCpuIdentity.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { readMachoImage, type ReadAt } from "./apple/MachoLoadCommandReader.js";
 import {
@@ -29,7 +31,7 @@ import {
   sameRegularFileState,
   type StableRegularFileDescriptor,
 } from "../filesystem/RegularFile.js";
-import { readFileHandleChunks } from "../filesystem/readFileHandleChunks.js";
+import { readArtifactFileChunks } from "./readArtifactFileChunks.js";
 
 /** Read-only universal Mach-O slice reader backed by native lipo metadata. */
 export class MachOSliceArtifactReader implements ArtifactReader {
@@ -39,6 +41,7 @@ export class MachOSliceArtifactReader implements ArtifactReader {
   #ownedSource: OwnedFileHandle | undefined;
   #pendingSource: Promise<StableRegularFileDescriptor> | undefined;
   readonly #entries = new Map<string, ArtifactEntry>();
+  readonly #pendingCommands = new Set<Promise<unknown>>();
   readonly #ownsSource: boolean;
   #closed = false;
   #closePromise: Promise<void> | undefined;
@@ -59,16 +62,48 @@ export class MachOSliceArtifactReader implements ArtifactReader {
     this.#entries.clear();
     const source = await this.#ensureSource();
     await this.#verifySource(source);
-    const captured = await this.runner.run(
+    if (this.#closed)
+      throw new ArtifactReaderFailure(
+        "unavailable",
+        "Universal Mach-O reader is closed",
+      );
+    const command = this.runner.run(
       "lipo",
       ["-detailed_info", this.path],
       signal === undefined ? {} : { signal },
     );
+    this.#pendingCommands.add(command);
+    let captured: Awaited<typeof command>;
+    try {
+      captured = await command;
+    } finally {
+      this.#pendingCommands.delete(command);
+    }
     if (!captured.ok)
       throw new ArtifactReaderFailure(
         captured.error.reason === "cancelled" ? "cancelled" : "unavailable",
-        "lipo could not enumerate universal Mach-O slices",
-        { cause: captured.error },
+        captured.error.detail === null
+          ? "lipo could not enumerate universal Mach-O slices"
+          : `lipo could not enumerate universal Mach-O slices: ${captured.error.detail}`,
+        {
+          cause: captured.error,
+          ...(captured.error.cleanupFailure === null &&
+          captured.error.cleanupResources.length === 0
+            ? {}
+            : {
+                cleanup: {
+                  reason:
+                    captured.error.cleanupFailure ??
+                    "Native command cleanup remains unverified",
+                  resources: [...captured.error.cleanupResources],
+                },
+              }),
+        },
+      );
+    if (this.#closed)
+      throw new ArtifactReaderFailure(
+        "unavailable",
+        "Universal Mach-O reader closed during slice discovery",
       );
     this.#command = {
       tool: captured.value.tool,
@@ -80,7 +115,7 @@ export class MachOSliceArtifactReader implements ArtifactReader {
     };
     await this.#verifySource(source);
     const fileSize = source.initial.size;
-    const architectures = parseLipoArchitectures(captured.value.stdout);
+    const { architectures } = parseLipoOutput(captured.value.stdout, this.path);
     const structural = await readStructuralSlices(source.handle, fileSize);
     await this.#verifySource(source);
     if (structural.status === "malformed")
@@ -88,9 +123,16 @@ export class MachOSliceArtifactReader implements ArtifactReader {
         "integrity",
         `Mach-O structural slice index is malformed: ${structural.reason}`,
       );
-    if (structural.status === "unsupported")
+    // A valid universal binary can hold slices REA cannot index, such as
+    // big-endian PowerPC. lipo's own ranges still inventory every slice.
+    if (
+      structural.status === "unsupported" &&
+      architectures.some(
+        ({ file_offset, size }) => file_offset === null || size === null,
+      )
+    )
       throw new ArtifactReaderFailure(
-        "format",
+        "unavailable",
         `Mach-O structural slice index is unsupported: ${structural.reason}`,
       );
     const slices = structural.status === "parsed" ? structural.slices : null;
@@ -151,7 +193,11 @@ export class MachOSliceArtifactReader implements ArtifactReader {
             ? [
                 "Structural Mach-O facts were unavailable; slice range is based on lipo output.",
               ]
-            : []),
+            : structural.status === "unsupported"
+              ? [
+                  `Structural Mach-O facts were unsupported (${structural.reason}); slice range is based on lipo output.`,
+                ]
+              : []),
           ...(architecture.file_offset === null || architecture.size === null
             ? [
                 "Slice range was derived from structural Mach-O facts because lipo omitted it.",
@@ -180,7 +226,9 @@ export class MachOSliceArtifactReader implements ArtifactReader {
   async open(entry: ArtifactEntry, signal?: AbortSignal): Promise<Readable> {
     if (signal?.aborted === true)
       return Promise.reject(
-        new ArtifactReaderFailure("cancelled", "Mach-O slice read cancelled"),
+        new ArtifactReaderFailure("cancelled", "Mach-O slice read cancelled", {
+          cause: signal.reason,
+        }),
       );
     const produced = this.#entries.get(entry.adapterKey);
     if (produced === undefined || !sameArtifactEntry(entry, produced))
@@ -212,48 +260,109 @@ export class MachOSliceArtifactReader implements ArtifactReader {
         "integrity",
         `Mach-O slice range is outside the artifact: ${entry.path}`,
       );
-    const sourceStream = readFileHandleChunks(source.handle, {
+    const sourceStream = readArtifactFileChunks(source.handle, {
       start: offset,
       end: offset + size - 1,
       ...(signal === undefined ? {} : { signal }),
     });
     const verifySource = () => this.#verifySource(source);
-    return Readable.from(
+    let validatingSource = false;
+    const completionFailure = (): ArtifactReaderFailure | undefined => {
+      const coverage = sourceStream.readCoverage();
+      if (coverage.kind !== "complete")
+        return new ArtifactReaderFailure(
+          "integrity",
+          `Mach-O slice read coverage is incomplete: ${entry.path}`,
+        );
+      if (coverage.bytes !== BigInt(size))
+        return new ArtifactReaderFailure(
+          "integrity",
+          `Mach-O slice size disagrees with lipo metadata: ${entry.path}`,
+        );
+      if (signal?.aborted)
+        return new ArtifactReaderFailure(
+          "cancelled",
+          "Mach-O slice read cancelled",
+          { cause: signal.reason },
+        );
+      return undefined;
+    };
+    const output = Readable.from(
       (async function* () {
-        let observedBytes = 0;
         try {
           for await (const raw of sourceStream) {
             const chunk = streamChunkToBuffer(raw);
-            observedBytes += chunk.byteLength;
-            if (observedBytes > size)
-              throw new ArtifactReaderFailure(
-                "integrity",
-                `Mach-O slice exceeded its reported size: ${entry.path}`,
-              );
+            if (
+              sourceStream.readCoverage().kind === "complete" &&
+              signal?.aborted
+            ) {
+              const failure = completionFailure();
+              if (failure !== undefined) throw failure;
+            }
             yield chunk;
           }
         } catch (cause: unknown) {
           if (cause instanceof ArtifactReaderFailure) throw cause;
-          if (signal?.aborted === true)
-            throw new ArtifactReaderFailure(
-              "cancelled",
-              "Mach-O slice read cancelled",
-              { cause },
-            );
           throw new ArtifactReaderFailure(
             "integrity",
             `Could not read Mach-O slice range: ${entry.path}`,
             { cause },
           );
         }
-        if (observedBytes !== size)
-          throw new ArtifactReaderFailure(
-            "integrity",
-            `Mach-O slice size disagrees with lipo metadata: ${entry.path}`,
-          );
-        await verifySource();
+        validatingSource = true;
+        const failure = completionFailure();
+        if (failure !== undefined) throw failure;
+        try {
+          await verifySource();
+          assertArtifactReadActive(signal);
+        } finally {
+          validatingSource = false;
+        }
       })(),
     );
+    const onSourceError = (cause: unknown): void => {
+      const completedCancellation =
+        cause instanceof ArtifactReaderFailure &&
+        cause.reason === "cancelled" &&
+        sourceStream.readCoverage().kind === "complete" &&
+        !validatingSource
+          ? completionFailure()
+          : undefined;
+      output.destroy(
+        completedCancellation ??
+          (cause instanceof ArtifactReaderFailure
+            ? cause
+            : new ArtifactReaderFailure(
+                "integrity",
+                `Could not read Mach-O slice range: ${entry.path}`,
+                { cause },
+              )),
+      );
+    };
+    sourceStream.on("error", onSourceError);
+    sourceStream.once("close", () =>
+      sourceStream.removeListener("error", onSourceError),
+    );
+    const onAbort = (): void => {
+      if (
+        sourceStream.readCoverage().kind === "complete" &&
+        (sourceStream.errored === null ||
+          (sourceStream.errored instanceof ArtifactReaderFailure &&
+            sourceStream.errored.reason === "cancelled")) &&
+        !validatingSource &&
+        !output.destroyed
+      ) {
+        const failure = completionFailure();
+        if (failure !== undefined) output.destroy(failure);
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    output.once("close", () => {
+      signal?.removeEventListener("abort", onAbort);
+      if (!sourceStream.destroyed) sourceStream.destroy();
+    });
+    if (signal?.aborted) onAbort();
+    return output;
   }
 
   provenance(): readonly ArtifactCommand[] {
@@ -262,11 +371,47 @@ export class MachOSliceArtifactReader implements ArtifactReader {
 
   async close(): Promise<void> {
     this.#closed = true;
-    this.#closePromise ??= this.#closeSource().catch((cause: unknown) => {
+    this.#closePromise ??= this.#releaseResources().catch((cause: unknown) => {
       this.#closePromise = undefined;
       throw cause;
     });
     return this.#closePromise;
+  }
+
+  async #releaseResources(): Promise<void> {
+    await Promise.allSettled(this.#pendingCommands);
+    let cleanup: ArtifactReaderFailure["cleanup"];
+    try {
+      const failures = (await this.runner.retryCleanup?.()) ?? [];
+      if (failures.length > 0)
+        cleanup = {
+          reason: failures
+            .map(
+              ({ reason, resources }) => `${resources.join(", ")}: ${reason}`,
+            )
+            .join("; "),
+          resources: [
+            ...new Set(failures.flatMap(({ resources }) => resources)),
+          ],
+        };
+    } catch (cause: unknown) {
+      cleanup = ArtifactReaderFailure.cleanupObservation(
+        cause,
+        "native-command-process-cleanup",
+      );
+    }
+    try {
+      await this.#closeSource();
+    } catch (cause: unknown) {
+      if (cleanup === undefined) throw cause;
+      throw ArtifactReaderFailure.withCleanup(cause, cleanup);
+    }
+    if (cleanup !== undefined)
+      throw new ArtifactReaderFailure(
+        "unavailable",
+        "Native command process cleanup remains incomplete",
+        { cleanup },
+      );
   }
 
   async #ensureSource(): Promise<StableRegularFileDescriptor> {
@@ -384,11 +529,26 @@ const lipoMatchesSlice = (
     (reported.size === null || reported.size === observed.slice_size) &&
     (reported.cpu_type_code === null ||
       reported.cpu_type_code === observedCpuType) &&
-    (reported.cpu_subtype_code === null ||
-      reported.cpu_subtype_code === observedCpuSubtype) &&
+    lipoSubtypeMatches(reported, observedCpuSubtype) &&
     (reported.alignment === null ||
       observed.fat_alignment_exponent === null ||
       reported.alignment === 2 ** observed.fat_alignment_exponent)
+  );
+};
+
+/**
+ * Compare the complete subtype when lipo printed its capability byte, and
+ * otherwise only the subtype bits its record names.
+ */
+const lipoSubtypeMatches = (
+  reported: LipoArchitecture,
+  observedCpuSubtype: number,
+): boolean => {
+  if (reported.cpu_subtype_code !== null)
+    return reported.cpu_subtype_code === observedCpuSubtype;
+  return (
+    reported.cpu_subtype_base === null ||
+    reported.cpu_subtype_base === machoCpuSubtypeBase(observedCpuSubtype)
   );
 };
 

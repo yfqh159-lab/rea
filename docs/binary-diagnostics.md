@@ -98,10 +98,14 @@ section, symbol, mitigation or linkage views. The default `complete` detail and
 CLI output are unchanged.
 
 Complete results have a 32 MiB input, 64 MiB reply, 1 MiB combined diagnostics
-and 30-second owned command deadline. The reply budget applies to the decoder
-record; the CLI/MCP Evidence envelope adds copies and encoding overhead. The
+and 30-second owned command deadline. `REA_PWNTOOLS_MAX_INPUT_BYTES` raises the
+input bound alone, up to 1 GiB; the reply and deadline bounds are unchanged. The
+reply budget applies to the decoder record; the CLI/MCP Evidence envelope adds
+copies and encoding overhead. The
 pinned MCP SDK defaults to a 10 MiB receive buffer. Large complete results need
-a caller-configured `StdioClientTransport({ maxBufferSize: ... })`; the large
+a caller-configured `StdioClientTransport({ maxBufferSize: ... })` and a matching
+server `REA_MCP_MAX_RESPONSE_BYTES`. See [MCP delivery budgets](mcp-contracts.md#tool-results).
+These settings affect delivery, not decoder coverage or limits. The large
 extended-index verification uses 256 MiB and an explicit five-minute request
 timeout in its separate opt-in MCP lane. REA does not silently truncate the result. Python lowers resource soft limits to at most 3 GiB virtual address space,
 30 CPU seconds and 64 MiB file output. Inherited tighter soft/hard limits are
@@ -143,6 +147,24 @@ received signal alone does not establish its exact cause. Dynamic tags require
 a complete DT_NULL inside PT_DYNAMIC; interpreter names and ranges end at the
 first NUL, with any padding still represented by the original segment range.
 
+## Ghidra process failures
+
+When output from the failing Ghidra startup or operation reports
+`java.lang.OutOfMemoryError`, REA returns `resource_constraint`. Java heap or GC
+overhead exhaustion includes heap-specific recovery advice. Metaspace and array
+size failures do not recommend increasing the heap; native-thread exhaustion is
+reported as a capacity constraint with unknown limits.
+
+`configured_jvm_max_heap` records the explicit `-Xmx` value selected by REA's
+launch builder. It is a configuration fact, not measured memory use or proof of
+the effective JVM limit; JVM environment options may affect that limit.
+When a Windows script wrapper selects the JVM, this value remains unknown.
+Historical stdout and stderr remain available, but classification uses only the
+failing operation's `failure_output`. Output draining waits at most one second,
+subject to earlier cancellation or the startup deadline. `output_incomplete`
+marks a snapshot taken before stream closure; cleanup ownership remains with
+the session until release succeeds.
+
 ## Portable PE resources
 
 `inspect_pe_resources` / `inspect-pe-resources` inspects an explicit PE32 or
@@ -181,7 +203,8 @@ payload ranges are supported. The supported tree has three levels: type, name,
 and language. Other resource payload formats remain opaque.
 
 `max_file_bytes` defaults to 64 MiB (maximum 512 MiB); `max_entries` defaults to
-4096 (maximum 65536). CLI options are `--max-file-bytes` and `--max-entries`.
+16384, the largest stock Windows resource image measured with headroom
+(maximum 65536). CLI options are `--max-file-bytes` and `--max-entries`.
 Metadata is bounded to 8 MiB; exceeding any budget fails without truncation.
 Large Evidence envelopes may require a caller-configured MCP transport receive
 buffer because envelope copies add overhead. Requests honor cancellation during

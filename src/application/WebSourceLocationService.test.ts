@@ -5,6 +5,11 @@ import {
   webSourceMapDecoderFixture as decoder,
 } from "../../tests/fixtures/webSourceLocation.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { parseEvidence } from "../domain/evidence.js";
+import {
+  AnalysisCancelledError,
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
 import { ok } from "../domain/result.js";
 import { webSourceLocationResultSchema } from "../domain/webSourceLocation.js";
 import { WebSourceLocationService } from "./WebSourceLocationService.js";
@@ -93,6 +98,52 @@ it.each(["digest", "url", "point"])(
     expect(response.error._tag).toBe("AnalysisOutputError");
   },
 );
+it.each([
+  {
+    runtime: {
+      id: "node-v8",
+      version: "v24.18.0",
+      v8_heap_limit_bytes: 201326592,
+    },
+    limitation: "192 MiB old-generation heap and one V8 worker",
+  },
+  {
+    runtime: {
+      id: "bun",
+      version: "1.4.2",
+      node_compatibility_version: "24.3.0",
+      v8_heap_limit_bytes: null,
+      process_memory_limit_bytes: 738197504,
+    },
+    limitation:
+      "a Windows Job Object limited its committed memory to 738197504 bytes",
+  },
+  {
+    runtime: {
+      id: "bun",
+      version: "1.4.2",
+      node_compatibility_version: "24.3.0",
+      v8_heap_limit_bytes: null,
+      process_memory_limit_bytes: null,
+    },
+    limitation: "so no codec heap limit is established",
+  },
+] as const)(
+  "states the codec memory bound its runtime enforced: $limitation",
+  async ({ runtime, limitation }) => {
+    const response = await service(undefined, {
+      trace: async (input) => {
+        const decoded = await decoder.trace(input);
+        if (!decoded.ok) return decoded;
+        return ok({ ...decoded.value, runtime });
+      },
+    }).trace(args);
+    if (!response.ok) throw response.error;
+    expect(
+      response.value.limitations.filter((text) => text.includes(limitation)),
+    ).toHaveLength(1);
+  },
+);
 it("honors cancellation both before acquisition and across decoder completion", async () => {
   const first = new AbortController();
   first.abort();
@@ -113,5 +164,42 @@ it("honors cancellation both before acquisition and across decoder completion", 
     },
   }).trace(args, { signal: controller.signal });
   if (late.ok) throw new Error("expected cancellation");
-  expect(late.error._tag).toBe("AnalysisCancelledError");
+  expect(late.error).toBeInstanceOf(AnalysisCancelledError);
+  expect(parseEvidence(late.error.partialObservation)).toMatchObject({
+    operation: "trace_web_source_location",
+    confidence: "derived",
+  });
+
+  const malformedDecoder: WebSourceMapPort = {
+    trace: async (input, options) => {
+      const decoded = await decoder.trace(input, options);
+      return decoded.ok
+        ? ok({ ...decoded.value, source_map_sha256: "b".repeat(64) })
+        : decoded;
+    },
+  };
+  const malformed = await new WebSourceLocationService(
+    { load: () => Promise.resolve(ok(webSourceLocationFixture())) },
+    malformedDecoder,
+  ).trace(args);
+  expect(malformed.ok).toBe(false);
+  if (!malformed.ok)
+    expect(malformed.error).toBeInstanceOf(AnalysisOutputError);
+
+  const invalidController = new AbortController();
+  const malformedLate = await new WebSourceLocationService(
+    { load: () => Promise.resolve(ok(webSourceLocationFixture())) },
+    {
+      trace: async (input, options) => {
+        const decoded = await decoder.trace(input, options);
+        invalidController.abort();
+        return decoded.ok
+          ? ok({ ...decoded.value, source_map_sha256: "b".repeat(64) })
+          : decoded;
+      },
+    },
+  ).trace(args, { signal: invalidController.signal });
+  expect(malformedLate.ok).toBe(false);
+  if (!malformedLate.ok)
+    expect(malformedLate.error).toBeInstanceOf(AnalysisOutputError);
 });
