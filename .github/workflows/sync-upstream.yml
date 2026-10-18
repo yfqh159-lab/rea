@@ -1,17 +1,12 @@
-name: Sync upstream (safe)
+name: Sync upstream (preserve fork commits)
 
 on:
   schedule:
     - cron: "37 2 * * *"
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/sync-upstream.yml
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-upstream-main
@@ -21,9 +16,28 @@ jobs:
   sync:
     if: github.repository == 'yfqh159-lab/rea'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
-      - name: Sync main from original repository without force
+      - name: Check out the fork with workflow-capable credentials
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Merge upstream main into the fork
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh repo sync "$GITHUB_REPOSITORY" --branch main
+          UPSTREAM_REPOSITORY: morluto/rea
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork main already contains upstream/main."
+            exit 0
+          fi
+
+          git merge --no-edit --no-ff upstream/main
+          git push origin HEAD:main
