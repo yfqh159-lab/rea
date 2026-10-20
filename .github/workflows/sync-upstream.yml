@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
-      - name: Merge upstream main into the fork
+      - name: Merge upstream main while preserving fork changes
         env:
           UPSTREAM_REPOSITORY: morluto/rea
         run: |
@@ -39,5 +39,23 @@ jobs:
             exit 0
           fi
 
-          git merge --no-edit --no-ff upstream/main
+          fork_before=$(git rev-parse HEAD)
+          upstream_head=$(git rev-parse upstream/main)
+          git merge --no-commit --no-ff -X ours upstream/main
+
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Unresolved conflicts remain; refusing to push." >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          fi
+
+          git commit -m "chore(sync): merge upstream main [skip ci]"
           git push origin HEAD:main
+
+          {
+            echo "### Upstream sync"
+            echo "- Fork before: \`${fork_before}\`"
+            echo "- Upstream head: \`${upstream_head}\`"
+            echo "- Fork after: \`$(git rev-parse HEAD)\`"
+            echo "- Conflict policy: preserve fork side for overlapping hunks"
+          } >> "$GITHUB_STEP_SUMMARY"
